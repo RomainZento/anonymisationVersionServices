@@ -40,6 +40,11 @@ compter() {
     grep -cE "$1" "$2"
 }
 
+# Inverse le résultat de la commande donnée.
+non() {
+    ! "$@"
+}
+
 # Vrai si le motif est absent du fichier.
 absent() {
     ! grep -q "$@"
@@ -191,6 +196,147 @@ test_ssh_directive_existante() {
     nettoyer
 }
 
+# --- verifier ---------------------------------------------------------------
+
+test_fuites_entetes() {
+    local masques='HTTP/1.1 200 OK
+Server: nginx
+Content-Type: text/html
+X-Powered-By: Express'
+    verifier "en-têtes masqués : aucune fuite" [ -z "$(fuites_entetes "$masques")" ]
+    verifier "en-têtes : version nginx détectée" [ -n "$(fuites_entetes 'Server: nginx/1.24.0')" ]
+    verifier "en-têtes : système Apache détecté" [ -n "$(fuites_entetes 'Server: Apache (Ubuntu)')" ]
+    verifier "en-têtes : version PHP détectée" [ -n "$(fuites_entetes 'x-powered-by: PHP/8.2.12')" ]
+    verifier "en-têtes : retour chariot HTTP ignoré" [ -z "$(fuites_entetes "$(printf 'Server: nginx\r')")" ]
+}
+
+test_fuites_page() {
+    verifier "page : version nginx détectée" \
+        [ "$(fuites_page '<hr><center>nginx/1.24.0</center>')" = "nginx/1.24.0" ]
+    verifier "page : signature Apache détectée" \
+        [ -n "$(fuites_page '<address>Apache/2.4.58 (Ubuntu) Server at localhost Port 80</address>')" ]
+    verifier "page masquée : aucune fuite" [ -z "$(fuites_page '<hr><center>nginx</center>')" ]
+}
+
+test_banniere_ssh() {
+    verifier "ssh : suffixe détecté" banniere_ssh_avec_suffixe 'SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13'
+    verifier "ssh : bannière masquée acceptée" non banniere_ssh_avec_suffixe 'SSH-2.0-OpenSSH_9.6p1'
+}
+
+test_fuites_php_ini() {
+    preparer
+    mkdir -p "$RACINE/etc/php/8.2/fpm" "$RACINE/etc/php/8.2/cli"
+    printf '[PHP]\nexpose_php = Off\n' >"$RACINE/etc/php/8.2/fpm/php.ini"
+    printf '[PHP]\nexpose_php = On\n' >"$RACINE/etc/php/8.2/cli/php.ini"
+    verifier "php.ini : seul le fichier à On est signalé" \
+        [ "$(fuites_php_ini)" = "$RACINE/etc/php/8.2/cli/php.ini" ]
+    masquer_php
+    verifier "php.ini : plus de fuite après masquage" [ -z "$(fuites_php_ini)" ]
+    nettoyer
+}
+
+test_comparer_etats() {
+    preparer
+    printf 'service nginx actif\nservice php8.2-fpm.service actif\nhttp 80 200\nhttp 443 301\n' >"$RACINE/avant"
+    cp "$RACINE/avant" "$RACINE/identique"
+    printf 'service nginx actif\nhttp 80 502\n' >"$RACINE/apres"
+    verifier "états identiques : aucune régression" [ -z "$(comparer_etats "$RACINE/avant" "$RACINE/identique")" ]
+    local regressions
+    regressions="$(comparer_etats "$RACINE/avant" "$RACINE/apres")"
+    verifier "régression : service arrêté détecté" grep -q 'php8.2-fpm.service' <<<"$regressions"
+    verifier "régression : code HTTP changé détecté" grep -q 'port 80 : code HTTP 200 avant, 502' <<<"$regressions"
+    verifier "régression : port disparu détecté" grep -q 'port 443 : code HTTP 301 avant, absent' <<<"$regressions"
+    verifier "régression : service toujours actif non signalé" non grep -q 'service nginx' <<<"$regressions"
+    nettoyer
+}
+
+# --- sauvegardes, annuler, nettoyer -----------------------------------------
+
+# Machine fictive avec nginx, Apache (Debian) et SSH à masquer.
+preparer_machine() {
+    ecrire_nginx_conf
+    mkdir -p "$RACINE/etc/apache2" "$RACINE/etc/ssh"
+    printf 'Include /etc/ssh/sshd_config.d/*.conf\nPort 22\n' >"$RACINE/etc/ssh/sshd_config"
+    cp "$RACINE/etc/nginx/nginx.conf" "$RACINE/nginx.original"
+}
+
+test_manifeste() {
+    preparer
+    preparer_machine
+    HORODATAGE="20260101-000000"
+    appliquer >/dev/null
+    local manifeste="$RACINE/var/backups/masquage-versions/20260101-000000/manifeste.txt"
+    verifier "manifeste : créé" [ -f "$manifeste" ]
+    verifier "manifeste : fichier modifié listé" grep -qx 'nginx modifie /etc/nginx/nginx.conf' "$manifeste"
+    verifier "manifeste : fichier créé listé" grep -qx 'ssh cree /etc/ssh/sshd_config.d/00-masquage-version.conf' "$manifeste"
+    verifier "manifeste : lien Apache listé" grep -qx 'apache cree /etc/apache2/conf-enabled/zz-masquage-version.conf' "$manifeste"
+    verifier "sauvegardes : accès root uniquement" \
+        [ "$(ls -ld "$RACINE/var/backups/masquage-versions" | cut -c1-10)" = "drwx------" ]
+    nettoyer
+}
+
+test_annuler() {
+    preparer
+    preparer_machine
+    HORODATAGE="20260101-000000"
+    appliquer >/dev/null
+    annuler >/dev/null
+    verifier "annuler : nginx.conf d'origine" cmp -s "$RACINE/nginx.original" "$RACINE/etc/nginx/nginx.conf"
+    verifier "annuler : fichier Apache supprimé" [ ! -e "$RACINE/etc/apache2/conf-available/zz-masquage-version.conf" ]
+    verifier "annuler : lien Apache supprimé" [ ! -L "$RACINE/etc/apache2/conf-enabled/zz-masquage-version.conf" ]
+    verifier "annuler : fichier SSH supprimé" [ ! -e "$RACINE/etc/ssh/sshd_config.d/00-masquage-version.conf" ]
+    verifier "annuler : manifeste marqué annulé" \
+        [ -f "$RACINE/var/backups/masquage-versions/20260101-000000/manifeste.annule.txt" ]
+    annuler >/dev/null 2>&1
+    verifier "annuler : rien à annuler une seconde fois" [ $? = 1 ]
+    nettoyer
+}
+
+test_annuler_deux_passages() {
+    preparer
+    preparer_machine
+    HORODATAGE="20260101-000000"
+    appliquer >/dev/null
+    mkdir -p "$RACINE/etc/nginx/sites-available"
+    printf 'server {\n    server_tokens on;\n}\n' >"$RACINE/etc/nginx/sites-available/nouveau"
+    HORODATAGE="20260102-000000"
+    appliquer >/dev/null
+    annuler >/dev/null
+    verifier "deux passages : le dernier est annulé en premier" \
+        grep -q 'server_tokens on' "$RACINE/etc/nginx/sites-available/nouveau"
+    verifier "deux passages : le premier est encore en place" \
+        grep -q 'server_tokens off' "$RACINE/etc/nginx/nginx.conf"
+    annuler >/dev/null
+    verifier "deux passages : retour complet à l'origine" cmp -s "$RACINE/nginx.original" "$RACINE/etc/nginx/nginx.conf"
+    nettoyer
+}
+
+test_annuler_date_invalide() {
+    preparer
+    annuler '../../etc' >/dev/null 2>&1
+    verifier "annuler : date invalide refusée" [ $? = 1 ]
+    nettoyer
+}
+
+test_nettoyer_garde_la_derniere() {
+    preparer
+    preparer_machine
+    HORODATAGE="20260101-000000"
+    appliquer >/dev/null
+    mkdir -p "$RACINE/etc/nginx/sites-available"
+    printf 'server {\n    server_tokens on;\n}\n' >"$RACINE/etc/nginx/sites-available/nouveau"
+    HORODATAGE="20260102-000000"
+    appliquer >/dev/null
+    nettoyer_sauvegardes >/dev/null
+    local racine="$RACINE/var/backups/masquage-versions"
+    verifier "nettoyer : ancienne sauvegarde supprimée" [ ! -d "$racine/20260101-000000" ]
+    verifier "nettoyer : dernière sauvegarde conservée" [ -f "$racine/20260102-000000/manifeste.txt" ]
+    annuler >/dev/null
+    verifier "nettoyer : la sauvegarde conservée reste annulable" \
+        grep -q 'server_tokens on' "$RACINE/etc/nginx/sites-available/nouveau"
+    nettoyer
+}
+
 # --- lancement --------------------------------------------------------------
 
 test_extraire_version
@@ -205,6 +351,16 @@ test_php
 test_ssh_avec_include
 test_ssh_sans_include
 test_ssh_directive_existante
+test_fuites_entetes
+test_fuites_page
+test_banniere_ssh
+test_fuites_php_ini
+test_comparer_etats
+test_manifeste
+test_annuler
+test_annuler_deux_passages
+test_annuler_date_invalide
+test_nettoyer_garde_la_derniere
 
 echo "Réussis : $REUSSIS  Echecs : $ECHECS"
 [ "$ECHECS" = 0 ]
