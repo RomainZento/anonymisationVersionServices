@@ -348,9 +348,11 @@ valider_apache() {
 # SSH : retire le suffixe de distribution de la bannière
 # (SSH-2.0-OpenSSH_9.6p1 Ubuntu-3 devient SSH-2.0-OpenSSH_9.6p1).
 # Seule l'option DebianBanner (Debian/Ubuntu) le permet sans recompiler.
+# sshd -T n'affiche pas DebianBanner même quand l'option existe : on demande
+# donc directement à sshd s'il accepte la configuration avec cette option.
 ssh_accepte_debianbanner() {
     [ "$RECHARGER" = 0 ] && return 0
-    sshd -T 2>/dev/null | grep -qi '^debianbanner'
+    sshd -t -o DebianBanner=no >/dev/null 2>&1
 }
 
 masquer_ssh() {
